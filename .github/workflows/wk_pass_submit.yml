@@ -13,7 +13,7 @@ jobs:
     steps:
       - name: Submit due reviews from Gist
         env:
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_TOKEN: ${{ secrets.WK_GIST_TOKEN }}
           WK_API_KEY: ${{ secrets.WK_API_KEY }}
           GIST_ID:    7a1082751cca1b6d2396d623ff9124b2
           GIST_FILE:  wk_pass_pending.json
