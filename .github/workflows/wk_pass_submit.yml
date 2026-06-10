@@ -1,48 +1,63 @@
-name: WaniKani Auto-Submit Pending Reviews
+name: WaniKani – Auto-submit Pass Hour reviews
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 jobs:
   submit:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
 
     steps:
-      - name: Submit pending reviews
+      - name: Submit due reviews from Gist
         env:
-          WK_API_KEY:      ${{ secrets.WK_API_KEY }}
-          WK_GIST_TOKEN:   ${{ secrets.WK_GIST_TOKEN }}
-          WK_PASS_GIST_ID: ${{ secrets.WK_PASS_GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          WK_API_KEY: ${{ secrets.WK_API_KEY }}
+          GIST_ID:    7a1082751cca1b6d2396d623ff9124b2
+          GIST_FILE:  wk_pass_pending.json
         run: |
           python3 << 'PYEOF'
-          import urllib.request, urllib.error, json, os, sys
+          import json, os, sys, urllib.request, urllib.error
           from datetime import datetime, timezone
 
-          WK_KEY    = os.environ.get('WK_API_KEY', '').strip()
-          GH_TOKEN  = os.environ.get('WK_GIST_TOKEN', '').strip()
-          GIST_ID   = os.environ.get('WK_PASS_GIST_ID', '').strip()
-          GIST_FILE = 'wk_pass_pending.json'
+          GIST_TOKEN = os.environ['GIST_TOKEN']
+          WK_API_KEY = os.environ['WK_API_KEY']
+          GIST_ID    = os.environ['GIST_ID']
+          GIST_FILE  = os.environ['GIST_FILE']
 
-          if not all([WK_KEY, GH_TOKEN, GIST_ID]):
-              print("ERROR: Missing secrets."); sys.exit(1)
+          def parse_iso(s):
+              return datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
 
-          def gh_request(method, url, body=None):
+          def gist_get():
               req = urllib.request.Request(
-                  url, data=json.dumps(body).encode() if body else None,
+                  f'https://api.github.com/gists/{GIST_ID}',
                   headers={
-                      'Authorization': f'token {GH_TOKEN}',
-                      'Content-Type':  'application/json',
-                      'Accept':        'application/vnd.github.v3+json',
-                  },
-                  method=method,
+                      'Authorization': f'token {GIST_TOKEN}',
+                      'Accept': 'application/vnd.github.v3+json',
+                      'User-Agent': 'wk-pass-action',
+                  }
               )
-              with urllib.request.urlopen(req, timeout=10) as r:
-                  return json.loads(r.read()), r.status
+              with urllib.request.urlopen(req, timeout=15) as res:
+                  return json.loads(res.read())
 
-          def wk_post_review(entry):
+          def gist_patch(pending):
+              body = json.dumps({'files': {GIST_FILE: {'content': json.dumps(pending, indent=2)}}}).encode()
+              req = urllib.request.Request(
+                  f'https://api.github.com/gists/{GIST_ID}',
+                  data=body, method='PATCH',
+                  headers={
+                      'Authorization': f'token {GIST_TOKEN}',
+                      'Content-Type': 'application/json',
+                      'Accept': 'application/vnd.github.v3+json',
+                      'User-Agent': 'wk-pass-action',
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=15) as res:
+                  return res.status
+
+          def wk_submit(entry):
               body = json.dumps({
                   'review': {
                       'assignment_id':             entry['assignmentId'],
@@ -52,80 +67,71 @@ jobs:
               }).encode()
               req = urllib.request.Request(
                   'https://api.wanikani.com/v2/reviews',
-                  data=body,
+                  data=body, method='POST',
                   headers={
-                      'Authorization':     f'Bearer {WK_KEY}',
+                      'Authorization':     f'Bearer {WK_API_KEY}',
                       'Content-Type':      'application/json',
                       'Wanikani-Revision': '20170710',
-                  },
-                  method='POST',
+                  }
               )
               try:
-                  with urllib.request.urlopen(req, timeout=10) as r:
-                      return r.status in (200, 201), r.status, r.read().decode()[:200]
+                  with urllib.request.urlopen(req, timeout=15) as res:
+                      ok = res.status in (200, 201)
+                      print(f'    WK {res.status}: {res.read().decode()[:200]}')
+                      return ok
               except urllib.error.HTTPError as e:
-                  return False, e.code, e.read().decode()[:200]
+                  print(f'    WK HTTP {e.code}: {e.read().decode()[:300]}')
+                  return False
+              except Exception as ex:
+                  print(f'    WK error: {ex}')
+                  return False
 
-          print(f"Reading Gist {GIST_ID}...")
+          print('Reading Gist...')
           try:
-              gist, _ = gh_request('GET', f'https://api.github.com/gists/{GIST_ID}')
+              gist    = gist_get()
+              raw     = gist.get('files', {}).get(GIST_FILE, {}).get('content', '[]')
+              pending = json.loads(raw)
           except Exception as e:
-              print(f"ERROR reading Gist: {e}"); sys.exit(1)
-
-          content = gist.get('files', {}).get(GIST_FILE, {}).get('content', '[]')
-          try:
-              pending = json.loads(content or '[]')
-          except Exception:
-              print("ERROR: Could not parse Gist content as JSON"); sys.exit(1)
+              print(f'ERROR reading Gist: {e}')
+              sys.exit(1)
 
           if not pending:
-              print("No pending reviews."); sys.exit(0)
+              print('Gist is empty — nothing to do.')
+              sys.exit(0)
 
-          print(f"Found {len(pending)} pending review(s).")
-
-          now = datetime.now(timezone.utc)
-          due = []
-          for p in pending:
-              try:
-                  avail_at = datetime.fromisoformat(p['availableAt'].replace('Z', '+00:00'))
-                  if avail_at <= now:
-                      due.append(p)
-                  else:
-                      delta = avail_at - now
-                      mins  = int(delta.total_seconds() / 60)
-                      print(f"  Waiting: {p['characters']} in {mins}m")
-              except Exception as e:
-                  print(f"  Skipping {p.get('characters','?')}: {e}")
+          now = datetime.now(timezone.utc).timestamp()
+          due = [p for p in pending if parse_iso(p['availableAt']) <= now]
+          print(f'Pending: {len(pending)}  |  Due now: {len(due)}')
 
           if not due:
-              print("No reviews due yet."); sys.exit(0)
+              nxt  = min(pending, key=lambda p: p['availableAt'])
+              mins = max(0, round((parse_iso(nxt['availableAt']) - now) / 60))
+              print(f"Next due: {nxt['characters']} in ~{mins} min")
+              sys.exit(0)
 
-          print(f"Submitting {len(due)} due review(s)...")
+          submitted = set()
+          failed    = set()
 
-          submitted_ids = set()
           for entry in due:
-              if not entry.get('assignmentId'):
-                  print(f"  SKIP {entry['characters']} - no assignmentId")
+              chars = entry.get('characters', '?')
+              asgn  = entry.get('assignmentId')
+              if not asgn:
+                  print(f'  SKIP {chars} — missing assignmentId')
+                  failed.add(entry['subjectId'])
                   continue
-              ok, status, body = wk_post_review(entry)
-              if ok:
-                  submitted_ids.add(entry['subjectId'])
-                  print(f"  OK {entry['characters']} (assignment {entry['assignmentId']}) -> {status}")
+              print(f'  Submitting {chars} (assignment {asgn})...')
+              if wk_submit(entry):
+                  submitted.add(entry['subjectId'])
+                  print(f'  ✓ {chars}')
               else:
-                  print(f"  FAIL {entry['characters']} -> {status}: {body}")
+                  failed.add(entry['subjectId'])
+                  print(f'  ✗ {chars} — will retry')
 
-          if not submitted_ids:
-              print("No reviews submitted."); sys.exit(0)
-
-          remaining = [p for p in pending if p['subjectId'] not in submitted_ids]
-          print(f"Updating Gist: {len(submitted_ids)} submitted, {len(remaining)} remaining...")
-          try:
-              gh_request('PATCH', f'https://api.github.com/gists/{GIST_ID}', {
-                  'files': { GIST_FILE: { 'content': json.dumps(remaining, indent=2) } }
-              })
-              print("Gist updated.")
-          except Exception as e:
-              print(f"WARNING: Gist update failed (reviews were submitted): {e}")
-
-          print(f"Done. Submitted: {', '.join(p['characters'] for p in due if p['subjectId'] in submitted_ids)}")
+          if submitted:
+              remaining = [p for p in pending if p['subjectId'] not in submitted]
+              gist_patch(remaining)
+              print(f'Done: {len(submitted)} submitted | {len(failed)} failed | {len(remaining)} remaining')
+          else:
+              print('Nothing submitted this run.')
+              sys.exit(1)
           PYEOF
