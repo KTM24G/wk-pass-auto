@@ -14,24 +14,22 @@ jobs:
       - name: Submit due reviews from Gist
         env:
           GIST_TOKEN: ${{ secrets.WK_GIST_TOKEN }}
-          WK_API_KEY: ${{ secrets.WK_API_KEY }}
+          WK_API_KEY:  ${{ secrets.WK_API_KEY }}
           GIST_ID:    7a1082751cca1b6d2396d623ff9124b2
           GIST_FILE:  wk_pass_pending.json
         run: |
           python3 << 'PYEOF'
-          import json, os, sys, urllib.request, urllib.error
+          import json, os, sys, time, urllib.request, urllib.error
           from datetime import datetime, timezone
 
           GIST_TOKEN = os.environ.get('GIST_TOKEN', '')
-          WK_API_KEY = os.environ.get('WK_API_KEY', '') or 'ec933133-6d49-496b-b601-0f35ef40de73'
-          GIST_ID    = os.environ['GIST_ID']
-          GIST_FILE  = os.environ['GIST_FILE']
+          WK_API_KEY  = os.environ.get('WK_API_KEY', '') or 'ec933133-6d49-496b-b601-0f35ef40de73'
+          GIST_ID     = os.environ['GIST_ID']
+          GIST_FILE   = os.environ['GIST_FILE']
 
           if not GIST_TOKEN:
-              print('ERROR: GIST_TOKEN (WK_GIST_TOKEN secret) not set')
+              print('ERROR: WK_GIST_TOKEN secret not set')
               sys.exit(1)
-
-          print(f'WK_API_KEY: {"from secret" if os.environ.get("WK_API_KEY") else "using built-in fallback"}')
 
           def parse_iso(s):
               return datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
@@ -39,63 +37,57 @@ jobs:
           def gist_get():
               req = urllib.request.Request(
                   f'https://api.github.com/gists/{GIST_ID}',
-                  headers={
-                      'Authorization': f'token {GIST_TOKEN}',
-                      'Accept': 'application/vnd.github.v3+json',
-                      'User-Agent': 'wk-pass-action',
-                  }
-              )
+                  headers={'Authorization': f'token {GIST_TOKEN}',
+                           'Accept': 'application/vnd.github.v3+json',
+                           'User-Agent': 'wk-pass-action'})
               with urllib.request.urlopen(req, timeout=15) as res:
                   return json.loads(res.read().decode())
 
           def gist_patch(pending):
-              body = json.dumps({
-                  'files': {GIST_FILE: {'content': json.dumps(pending, indent=2)}}
-              }).encode()
+              body = json.dumps({'files': {GIST_FILE: {'content': json.dumps(pending, indent=2)}}}).encode()
               req = urllib.request.Request(
                   f'https://api.github.com/gists/{GIST_ID}',
                   data=body, method='PATCH',
-                  headers={
-                      'Authorization': f'token {GIST_TOKEN}',
-                      'Content-Type': 'application/json',
-                      'Accept': 'application/vnd.github.v3+json',
-                      'User-Agent': 'wk-pass-action',
-                  }
-              )
+                  headers={'Authorization': f'token {GIST_TOKEN}',
+                           'Content-Type': 'application/json',
+                           'Accept': 'application/vnd.github.v3+json',
+                           'User-Agent': 'wk-pass-action'})
               with urllib.request.urlopen(req, timeout=15) as res:
                   return res.status
 
-          def wk_submit(entry):
-              body = json.dumps({
-                  'review': {
-                      'assignment_id':             entry['assignmentId'],
-                      'incorrect_meaning_answers': entry['incorrectMeaning'],
-                      'incorrect_reading_answers': entry['incorrectReading'],
-                  }
-              }).encode()
-              req = urllib.request.Request(
-                  'https://api.wanikani.com/v2/reviews',
-                  data=body, method='POST',
-                  headers={
-                      'Authorization':     f'Bearer {WK_API_KEY}',
-                      'Content-Type':      'application/json',
-                      'Wanikani-Revision': '20170710',
-                  }
-              )
-              try:
-                  with urllib.request.urlopen(req, timeout=15) as res:
-                      print(f'    WK {res.status}: {res.read().decode()[:200]}')
-                      return res.status in (200, 201)
-              except urllib.error.HTTPError as e:
-                  body_txt = e.read().decode()[:300]
-                  print(f'    WK HTTP {e.code}: {body_txt}')
-                  # 422 = already reviewed or assignment no longer available
-                  if e.code == 422:
-                      return 'already_done'
-                  return False
-              except Exception as ex:
-                  print(f'    WK error: {ex}')
-                  return False
+          def wk_submit(entry, retries=3):
+              body = json.dumps({'review': {
+                  'subject_id': entry['subjectId'],
+                  'incorrect_meaning_answers': entry.get('incorrectMeaning', 0),
+                  'incorrect_reading_answers':  entry.get('incorrectReading', 0),
+              }}).encode()
+              headers = {'Authorization': f'Bearer {WK_API_KEY}',
+                         'Content-Type': 'application/json',
+                         'Wanikani-Revision': '20170710'}
+              for attempt in range(1, retries + 1):
+                  try:
+                      req = urllib.request.Request(
+                          'https://api.wanikani.com/v2/reviews',
+                          data=body, method='POST', headers=headers)
+                      with urllib.request.urlopen(req, timeout=20) as res:
+                          d = json.loads(res.read().decode())
+                          frm = d.get('data', {}).get('starting_srs_stage', '?')
+                          to  = d.get('data', {}).get('ending_srs_stage', '?')
+                          print(f'    OK SRS {frm}->{to}')
+                          return 'ok'
+                  except urllib.error.HTTPError as e:
+                      if e.code == 422:
+                          print(f'    already done (422)')
+                          return 'already_done'
+                      err = e.read().decode()[:120]
+                      print(f'    HTTP {e.code} attempt {attempt}/{retries}: {err}')
+                      if attempt < retries:
+                          time.sleep(10)
+                  except Exception as ex:
+                      print(f'    error attempt {attempt}/{retries}: {ex}')
+                      if attempt < retries:
+                          time.sleep(10)
+              return 'failed'
 
           print('Reading Gist...')
           try:
@@ -107,50 +99,37 @@ jobs:
               sys.exit(1)
 
           if not pending:
-              print('Gist is empty - nothing to do.')
+              print('Gist empty - nothing to do.')
               sys.exit(0)
 
           now = datetime.now(timezone.utc).timestamp()
-          due = [p for p in pending if parse_iso(p['availableAt']) <= now]
-          print(f'Pending: {len(pending)}  |  Due now: {len(due)}')
+          due     = [p for p in pending if parse_iso(p['availableAt']) <= now]
+          waiting = [p for p in pending if parse_iso(p['availableAt']) >  now]
+          print(f'Pending: {len(pending)}  Due: {len(due)}  Waiting: {len(waiting)}')
 
           if not due:
               nxt  = min(pending, key=lambda p: p['availableAt'])
               mins = max(0, round((parse_iso(nxt['availableAt']) - now) / 60))
-              print(f"Next due: {nxt['characters']} in ~{mins} min")
+              print(f"Next: {nxt['characters']} in {mins} min")
               sys.exit(0)
 
-          submitted    = set()
-          failed       = set()
-          already_done = set()
-
+          submitted, already_done, failed = set(), set(), set()
           for entry in due:
               chars = entry.get('characters', '?')
-              asgn  = entry.get('assignmentId')
-              if not asgn:
-                  print(f'  SKIP {chars} - missing assignmentId')
-                  already_done.add(entry['subjectId'])
-                  continue
-              print(f'  Submitting {chars} (assignment {asgn})...')
+              print(f'  Submitting {chars} (subj {entry["subjectId"]})...')
               result = wk_submit(entry)
-              if result == 'already_done':
-                  already_done.add(entry['subjectId'])
-                  print(f'  (already reviewed) {chars}')
-              elif result:
+              if result == 'ok':
                   submitted.add(entry['subjectId'])
-                  print(f'  OK {chars}')
+              elif result == 'already_done':
+                  already_done.add(entry['subjectId'])
               else:
                   failed.add(entry['subjectId'])
-                  print(f'  FAIL {chars} - will retry next run')
 
           done_ids = submitted | already_done
           if done_ids:
               remaining = [p for p in pending if p['subjectId'] not in done_ids]
               gist_patch(remaining)
-              print(f'Done: {len(submitted)} submitted | {len(already_done)} already-done cleaned | {len(failed)} failed | {len(remaining)} remaining')
+              print(f'Done: submitted={len(submitted)} already_done={len(already_done)} failed={len(failed)} remaining={len(remaining)}')
           else:
-              print(f'Nothing submitted this run - {len(failed)} failed, will retry.')
-
-          if failed and not submitted and not already_done:
-              sys.exit(1)
+              print(f'All failed ({len(failed)}) - will retry next run in 15 min')
           PYEOF
