@@ -2,7 +2,7 @@ name: WaniKani - Auto-submit Pass Hour reviews
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
